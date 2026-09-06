@@ -38,6 +38,8 @@ services:
       MONGO_HOST: mongo
       MONGO_PORT: "27017"
       MONGO_REPLICA_SET: ${MONGO_REPLICA_SET:-rs0}
+      MONGO_DB: ${MONGO_DB:-creditodb}
+      MONGO_COLLECTION: ${MONGO_COLLECTION:-propostas}
     volumes:
       - ./mongo/init-replica-set.sh:/init-replica-set.sh:ro
     entrypoint: ["bash", "/init-replica-set.sh"]
@@ -227,3 +229,35 @@ services:
       mongo-init:
         condition: service_healthy
     restart: unless-stopped
+
+  connector:
+    build:
+      context: ../connector
+      dockerfile: Dockerfile
+    image: credpipe/connector:1.0
+    hostname: connector
+    environment:
+      MONGO_HOST: ${MONGO_HOST:-mongo}
+      MONGO_PORT: ${MONGO_PORT:-27017}
+      MONGO_REPLICA_SET: ${MONGO_REPLICA_SET:-rs0}
+      MONGO_DB: ${MONGO_DB:-creditodb}
+      MONGO_COLLECTION: ${MONGO_COLLECTION:-propostas}
+      KAFKA_BOOTSTRAP_INTERNO: kafka:19092
+      KAFKA_TOPIC_PROPOSTAS: ${KAFKA_TOPIC_PROPOSTAS:-propostas.cdc}
+      KAFKA_DELIVERY_TIMEOUT_MS: ${KAFKA_DELIVERY_TIMEOUT_MS:-15000}
+      KAFKA_REQUEST_TIMEOUT_MS: ${KAFKA_REQUEST_TIMEOUT_MS:-5000}
+      CHECKPOINT_COLLECTION: ${CHECKPOINT_COLLECTION:-checkpoints}
+      CHECKPOINT_ID: ${CHECKPOINT_ID:-conector-propostas}
+      BATCH_MAX_SIZE: ${BATCH_MAX_SIZE:-50}
+      BATCH_MAX_INTERVALO_MS: ${BATCH_MAX_INTERVALO_MS:-2000}
+      RETRY_BACKOFF_INICIAL_MS: ${RETRY_BACKOFF_INICIAL_MS:-1000}
+      RETRY_BACKOFF_MAXIMO_MS: ${RETRY_BACKOFF_MAXIMO_MS:-30000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - credpipe-net
+    depends_on:
+      mongo-init:
+        condition: service_healthy
+      kafka-init:
+        condition: service_healthy
+    restart: "no"

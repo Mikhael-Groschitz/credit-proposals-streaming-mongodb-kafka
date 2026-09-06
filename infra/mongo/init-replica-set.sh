@@ -4,6 +4,8 @@ set -euo pipefail
 MONGO_HOST="${MONGO_HOST:-mongo}"
 MONGO_PORT="${MONGO_PORT:-27017}"
 MONGO_REPLICA_SET="${MONGO_REPLICA_SET:-rs0}"
+MONGO_DB="${MONGO_DB:-creditodb}"
+MONGO_COLLECTION="${MONGO_COLLECTION:-propostas}"
 SENTINEL=/tmp/init-done
 MAX_TENTATIVAS=60
 INTERVALO_SEGUNDOS=2
@@ -58,6 +60,25 @@ until [ "$(mongosh_eval 'rs.status().myState' | tail -n1)" = "1" ]; do
     sleep "${INTERVALO_SEGUNDOS}"
 done
 log "replica set pronto (PRIMARY eleito)."
+
+log "garantindo changeStreamPreAndPostImages habilitado em ${MONGO_DB}.${MONGO_COLLECTION}..."
+mongosh_eval "
+    banco = db.getSiblingDB('${MONGO_DB}');
+    try {
+        banco.createCollection('${MONGO_COLLECTION}', {
+            changeStreamPreAndPostImages: { enabled: true }
+        });
+    } catch (e) {
+        if (e.codeName === 'NamespaceExists') {
+            banco.runCommand({
+                collMod: '${MONGO_COLLECTION}',
+                changeStreamPreAndPostImages: { enabled: true }
+            });
+        } else {
+            throw e;
+        }
+    }
+"
 
 touch "${SENTINEL}"
 log "sentinela criada em ${SENTINEL}, aguardando indefinidamente (healthcheck le este arquivo)."
