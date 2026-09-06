@@ -1,3 +1,5 @@
+from bson import Timestamp
+
 from app.eventos import construir_evento
 
 
@@ -58,6 +60,33 @@ def test_sem_id_proposta_disponivel_usa_document_key_como_fallback():
 
     assert evento.id_proposta == "abc123"
     assert evento.envelope["chave_derivada_de_fallback"] is True
+
+
+def test_cluster_time_epoch_extraido_do_timestamp_bson():
+    change = {
+        "_id": {"_data": "8270..."},
+        "operationType": "insert",
+        "documentKey": {"_id": "abc123"},
+        "fullDocument": {"id_proposta": "prop-4"},
+        "clusterTime": Timestamp(1788710806, 5),
+    }
+
+    evento = construir_evento(change)
+
+    assert evento.envelope["cluster_time_epoch"] == 1788710806
+
+
+def test_cluster_time_epoch_e_none_quando_ausente():
+    change = {
+        "_id": {"_data": "8271..."},
+        "operationType": "insert",
+        "documentKey": {"_id": "abc123"},
+        "fullDocument": {"id_proposta": "prop-5"},
+    }
+
+    evento = construir_evento(change)
+
+    assert evento.envelope["cluster_time_epoch"] is None
 
 
 def test_resume_token_do_evento_e_o_id_do_change_stream():

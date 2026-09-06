@@ -19,7 +19,9 @@ de passar para a próxima. Por enquanto:
 - [x] **Fase 2 — Conector de change streams**: resume token durável,
       `fullDocument`/`fullDocumentBeforeChange`, publicação no Kafka com
       confirmação antes do checkpoint, roteiro de resiliência
-- [ ] Fase 3 — Bronze em streaming
+- [x] **Fase 3 — Bronze em streaming**: Spark Structured Streaming lendo o
+      Kafka e gravando em Delta no MinIO, particionado por data do evento,
+      com checkpoint próprio
 - [ ] Fase 4 — Silver e estado atual
 - [ ] Fase 5 — Gold, qualidade e observabilidade
 
@@ -44,7 +46,7 @@ flowchart LR
     MONGO -->|change stream| CS
     CS -->|chave = id_proposta| KAFKA[("Kafka\ntópico propostas.cdc")]
 
-    subgraph f3["Fase 3 — planejado"]
+    subgraph f3["Fase 3 — pronto"]
         BRONZE["Spark Structured Streaming\nBronze"]
     end
     KAFKA --> BRONZE
@@ -173,10 +175,13 @@ Serviço Python (`connector/`) que abre um change stream na coleção
 próprio no Compose, depende de `mongo-init` e `kafka-init` saudáveis.
 
 O envelope publicado inclui `id_proposta`, `operation_type`, `cluster_time`,
-`resume_token`, `document_key`, `full_document`, `full_document_before_change`
-e `update_description` — serializados com `bson.json_util` (extended JSON
-relaxado), para que a Fase 3 consiga ler o JSON diretamente sem reimplementar
-a decodificação de tipos BSON (`ObjectId`, `datetime`, `Timestamp`).
+`cluster_time_epoch` (o mesmo instante, já como inteiro Unix — evita a
+Fase 3 ter que decodificar o formato `{"$timestamp": {...}}` do extended
+JSON só para particionar por data), `resume_token`, `document_key`,
+`full_document`, `full_document_before_change` e `update_description` —
+serializados com `bson.json_util` (extended JSON relaxado), para que a
+Fase 3 consiga ler o JSON diretamente sem reimplementar a decodificação de
+tipos BSON (`ObjectId`, `datetime`, `Timestamp`).
 
 | Variável | Papel |
 |---|---|
@@ -188,6 +193,66 @@ a decodificação de tipos BSON (`ObjectId`, `datetime`, `Timestamp`).
 O roteiro completo de resiliência (reinício do conector, queda do Kafka,
 queda do Mongo, e resume token inválido/corrompido) está na seção
 "Roteiro de resiliência (Fase 2)", mais abaixo.
+
+## Fase 3 — o que existe hoje
+
+### Bronze em streaming
+
+Job Spark Structured Streaming (`spark-jobs/bronze/bronze_job.py`) que lê o
+tópico `propostas.cdc` continuamente e grava em Delta no MinIO
+(`s3a://bronze/propostas`), particionado por `data_evento` (a data derivada
+de `cluster_time_epoch`, não a data de ingestão). Roda como serviço próprio
+no Compose (`bronze`), submetido via `spark-submit` contra o cluster
+standalone (`spark://spark-master:7077`) — nada de rodar do host.
+
+Nenhuma transformação de negócio: o job desserializa só os campos estáveis
+do envelope (`id_proposta`, `operation_type`, `cluster_time_epoch`,
+`resume_token_data`, metadados do Kafka) como colunas tipadas, e mantém
+`full_document`, `full_document_before_change`, `update_description` e
+`document_key` como colunas de texto JSON — sem tentar achatar os campos
+que variam por `tipo_produto`. Isso é trabalho da Fase 4. Também mantém
+`envelope_bruto` (a mensagem Kafka original, sem nenhum parsing) como
+coluna própria, garantindo fidelidade total mesmo se algum parsing
+específico tiver um bug.
+
+| Variável | Papel |
+|---|---|
+| `BRONZE_PATH` / `BRONZE_CHECKPOINT_PATH` | caminho da tabela Delta e do checkpoint da Structured Streaming no MinIO |
+| `BRONZE_TRIGGER_INTERVALO` | intervalo do micro-batch nativo do motor de streaming do Spark |
+| `BRONZE_SHUFFLE_PARTITIONS` | número de partições de shuffle (baixo de propósito, dado o volume pequeno do gerador) |
+
+### Rodando o smoke test do bronze
+
+```bash
+bash scripts/bootstrap.sh
+# aguardar o gerador produzir alguns eventos e o conector publicá-los
+docker compose -f infra/docker-compose.yml --env-file infra/.env logs -f bronze
+```
+
+Para inspecionar a tabela Delta diretamente (não pelo cluster — ver "por
+que `local[2]`" nas decisões abaixo):
+
+```bash
+cat > /tmp/verificar_bronze.py <<'EOF'
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.appName("verificar-bronze").master("local[2]").getOrCreate()
+df = spark.read.format("delta").load("s3a://bronze/propostas")
+print(f"total de linhas: {df.count()}")
+df.groupBy("operation_type").count().show()
+EOF
+docker compose -f infra/docker-compose.yml --env-file infra/.env cp /tmp/verificar_bronze.py spark-master:/tmp/verificar_bronze.py
+docker compose -f infra/docker-compose.yml --env-file infra/.env exec -T spark-master \
+  /opt/spark/bin/spark-submit /tmp/verificar_bronze.py
+```
+
+Validei rodando de verdade: a tabela particiona corretamente por
+`data_evento`, a distribuição por `operation_type` bate com o que o
+gerador produz, `full_document_json` preserva os campos específicos de
+cada tipo de produto, e um `delete` chega com `full_document_json` nulo e
+`full_document_before_change_json` populado — confirmando que a pré-imagem
+configurada na Fase 2 sobrevive o caminho inteiro até o bronze. Reiniciar
+o serviço `bronze` retoma do checkpoint (offset incrementando sem reset),
+sem reprocessar nem perder micro-lotes.
 
 ## Como executar (Linux / WSL2 + Docker Desktop)
 
@@ -598,13 +663,75 @@ container parar e ficar visivelmente parado (`docker compose ps` mostra
 `Exited`) em vez de entrar num crash-loop silencioso disfarçando o
 problema.
 
+## Decisões e trade-offs (Fase 3)
+
+**Bronze não achata `full_document` em colunas — mantém como texto JSON.**
+Consignado, cartão e FGTS têm campos diferentes, e um evento de `delete`
+não tem `full_document` nenhum (só `full_document_before_change`). Se eu
+tentasse aplicar um schema Spark rígido nessas colunas agora, um campo novo
+em qualquer tipo de produto quebraria o job, e `from_json` retornaria
+`null` silenciosamente para campos que não batem com o schema declarado —
+exatamente o tipo de perda de dado silenciosa que quero evitar. Uso
+`get_json_object` para extrair cada campo estável (`id_proposta`,
+`operation_type` etc.) como coluna tipada, e deixo os campos heterogêneos
+como string JSON intacta. Achatar isso em colunas por tipo de produto,
+preservando o resto numa coluna semiestruturada, é o trabalho da Fase 4 —
+aqui seria transformação de negócio antecipada.
+
+**Guardo `envelope_bruto` (a mensagem Kafka original) como coluna própria.**
+Mesmo já extraindo os campos que preciso, mantenho a string JSON completa e
+sem nenhum parsing ao lado. Se algum dia eu descobrir um bug na extração
+(um campo mal interpretado, por exemplo), os dados brutos continuam lá — a
+tabela bronze nunca perde informação que só existia na minha lógica de
+parsing do momento em que rodou.
+
+**Não faço nenhuma deduplicação no bronze.** O conector garante
+at-least-once, não exatamente-uma-vez — então o mesmo evento pode
+aparecer duas vezes no Kafka em cenários de crash-e-reprocessamento
+(documentado na Fase 2). Bronze grava tudo, duplicatas incluídas, porque
+decidir "o que conta como o mesmo evento" é uma regra de negócio, e a
+regra explícita deste projeto é: nenhuma transformação de negócio no
+bronze. A deduplicação acontece no merge da Fase 4.
+
+**Checkpoint da Structured Streaming no MinIO (`s3a://`), não em disco
+local do container.** Sem isso, matar o container do job perderia o
+progresso do streaming (offsets do Kafka processados até agora) junto com
+o container — a próxima subida reprocessaria tudo desde o início do
+tópico. Com o checkpoint em `s3a://bronze/_checkpoints/propostas`,
+comprovei reiniciando o serviço `bronze`: o offset do checkpoint continuou
+de onde parou, sem reprocessar nem pular nada.
+
+**`spark.cores.max=2` explícito no job — descobri isso testando de
+verdade, não por antecipação.** O `spark-worker` de nó único tem um total
+fixo de cores; sem limitar quanto cada aplicação Spark pode reservar, a
+primeira aplicação submetida ao cluster (o próprio job bronze) toma **todo**
+o cluster por padrão no modo standalone, e qualquer outra tentativa de
+rodar uma segunda aplicação (uma consulta ad-hoc, ou os jobs de silver/gold
+que vêm nas próximas fases) fica esperando recursos que nunca sobram. Achei
+isso ao tentar rodar uma verificação ad-hoc contra a tabela Delta enquanto
+o bronze estava no ar: o comando simplesmente travou. Corrigi limitando
+cada job a uma fração do cluster (`spark.cores.max`) e aumentei o
+`spark-worker` de 2 para 6 cores, dando espaço para bronze + silver + gold
+rodarem ao mesmo tempo mais adiante. Para qualquer consulta ad-hoc contra o
+Delta (como fiz para validar isso), uso `--master local[2]` em vez de
+`spark://spark-master:7077` — não compete pelo cluster standalone e lê o
+Delta no MinIO da mesma forma.
+
+**Trigger de streaming explícito (`BRONZE_TRIGGER_INTERVALO=10 seconds`),
+não o default "o mais rápido possível".** Um trigger nomeado deixa claro
+que isso é Structured Streaming de verdade (motor de micro-batch nativo do
+Spark, com checkpoint e rastreamento de offset), não um `while True` com
+`sleep` disfarçado de streaming — e evita gerar um arquivo Parquet novo a
+cada evento individual, o que acabaria em excesso de arquivos pequenos no
+Delta.
+
 ## Estrutura do repositório
 
 ```
 infra/            docker-compose.yml, Dockerfile do Spark, scripts de init
 generator/        gerador de carga operacional (Fase 1), com generator/tests/
 connector/        conector de change streams (Fase 2), com connector/tests/
-spark-jobs/       jobs Spark de bronze/silver/gold (Fases 3-5 — ainda não implementados)
+spark-jobs/       jobs Spark: bronze/ (Fase 3); silver/ e gold/ ainda não implementados
 scripts/          bootstrap.sh, teardown.sh, generate-kafka-cluster-id.sh
 ```
 
@@ -616,8 +743,6 @@ Roteiros de validação manual e de resiliência ficam no próprio README (ver
 
 O que pretendo adicionar nas próximas fases:
 
-- **Fase 3**: bronze em streaming real (Structured Streaming, não
-  micro-batch disfarçado), checkpoint.
 - **Fase 4**: histórico de mudanças, estado atual via merge, watermark e
   política de dado atrasado (com teste), tratamento de heterogeneidade de
   schema, tratamento de delete/replace na camada analítica — e é aqui que

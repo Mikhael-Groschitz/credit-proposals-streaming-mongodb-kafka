@@ -184,7 +184,7 @@ services:
     image: credpipe/spark:3.5.8
     hostname: spark-worker
     entrypoint: ["/opt/spark/bin/spark-class"]
-    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--cores", "2", "--memory", "2g", "--webui-port", "8081"]
+    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--cores", "6", "--memory", "3g", "--webui-port", "8081"]
     environment:
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
@@ -201,6 +201,48 @@ services:
       timeout: 5s
       retries: 20
       start_period: 15s
+
+  bronze:
+    image: credpipe/spark:3.5.8
+    hostname: bronze
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    command:
+      - "--master"
+      - "spark://spark-master:7077"
+      - "--conf"
+      - "spark.cores.max=2"
+      - "--conf"
+      - "spark.executor.memory=768m"
+      - "/opt/bronze/bronze_job.py"
+    volumes:
+      - ../spark-jobs/bronze:/opt/bronze:ro
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      KAFKA_BOOTSTRAP_INTERNO: kafka:19092
+      KAFKA_TOPIC_PROPOSTAS: ${KAFKA_TOPIC_PROPOSTAS:-propostas.cdc}
+      BRONZE_PATH: ${BRONZE_PATH:-s3a://bronze/propostas}
+      BRONZE_CHECKPOINT_PATH: ${BRONZE_CHECKPOINT_PATH:-s3a://bronze/_checkpoints/propostas}
+      BRONZE_TRIGGER_INTERVALO: ${BRONZE_TRIGGER_INTERVALO:-10 seconds}
+      BRONZE_SHUFFLE_PARTITIONS: ${BRONZE_SHUFFLE_PARTITIONS:-6}
+    ports:
+      - "4040:4040"
+    networks:
+      - credpipe-net
+    depends_on:
+      spark-worker:
+        condition: service_healthy
+      kafka-init:
+        condition: service_healthy
+      minio-init:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4040 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
 
   generator:
     build:

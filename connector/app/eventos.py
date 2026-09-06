@@ -31,11 +31,13 @@ def _extrair_id_proposta(change: dict) -> tuple[str, bool]:
 def construir_evento(change: dict) -> EventoAlteracao:
     operation_type = change["operationType"]
     id_proposta, chave_derivada_de_fallback = _extrair_id_proposta(change)
+    cluster_time = change.get("clusterTime")
 
     envelope: dict[str, Any] = {
         "id_proposta": id_proposta,
         "operation_type": operation_type,
-        "cluster_time": change.get("clusterTime"),
+        "cluster_time": cluster_time,
+        "cluster_time_epoch": cluster_time.time if cluster_time is not None else None,
         "resume_token": change["_id"],
         "document_key": change.get("documentKey"),
         "full_document": change.get("fullDocument"),
