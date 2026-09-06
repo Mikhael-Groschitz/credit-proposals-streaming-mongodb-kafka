@@ -22,14 +22,16 @@ de passar para a próxima. Por enquanto:
 - [x] **Fase 3 — Bronze em streaming**: Spark Structured Streaming lendo o
       Kafka e gravando em Delta no MinIO, particionado por data do evento,
       com checkpoint próprio
-- [ ] Fase 4 — Silver e estado atual
+- [x] **Fase 4 — Silver e estado atual**: histórico de mudanças (SCD2),
+      estado atual via merge, watermark com deduplicação, tratamento de
+      delete e de heterogeneidade de schema — cada um provado com teste
 - [ ] Fase 5 — Gold, qualidade e observabilidade
 
-As seções sobre exatamente-uma-vez de ponta a ponta, watermark/dado
-atrasado, heterogeneidade de schema na camada analítica e a comparação
-change streams × CDC do SQL Server vão entrar conforme eu implementar as
-fases correspondentes — não faz sentido documentar uma decisão de código
-que ainda não existe.
+A comparação change streams × CDC do SQL Server e a seção "Resiliência"
+consolidada (olhando o pipeline inteiro, não só uma peça) ficaram para a
+Fase 5 — fazem mais sentido como fechamento depois que o pipeline completo
+existir, em vez de forçadas numa fase que ainda não tinha gold nem
+qualidade prontos.
 
 ## Arquitetura de ponta a ponta (alvo do projeto completo)
 
@@ -52,7 +54,7 @@ flowchart LR
     KAFKA --> BRONZE
     BRONZE -->|Delta| LAKE_B[("MinIO: bronze")]
 
-    subgraph f4["Fase 4 — planejado"]
+    subgraph f4["Fase 4 — pronto"]
         SILVER["Spark: histórico de mudanças\n+ estado atual (merge)"]
     end
     LAKE_B --> SILVER
@@ -114,7 +116,7 @@ de status, o gerador de carga também produz:
 
 ### Ambiente Docker
 
-Todo serviço roda no Compose, na mesma rede `credpipe-net`:
+Coloquei todo serviço no Compose, na mesma rede `credpipe-net`:
 
 | Serviço | Papel |
 |---|---|
@@ -150,10 +152,11 @@ flowchart TD
 
 ### Gerador de carga operacional
 
-Simula o sistema operacional que grava propostas no Mongo: cria propostas
-dos três tipos, evolui o status conforme a máquina de estados acima, e
-produz deletes e correções retroativas, tudo em loop com taxa configurável.
-Código em [`generator/`](generator/), configurado inteiramente por
+Escrevi um gerador que simula o sistema operacional gravando propostas no
+Mongo: cria propostas dos três tipos, evolui o status conforme a máquina
+de estados acima, e produz deletes e correções retroativas, tudo em loop
+com taxa configurável. Código em [`generator/`](generator/), configurado
+inteiramente por
 variáveis de ambiente (ver [`infra/.env.example`](infra/.env.example)):
 
 | Variável | Papel |
@@ -169,8 +172,8 @@ variáveis de ambiente (ver [`infra/.env.example`](infra/.env.example)):
 
 ### Conector de change streams
 
-Serviço Python (`connector/`) que abre um change stream na coleção
-`propostas`, monta um envelope JSON por evento e publica no tópico
+Escrevi um serviço Python (`connector/`) que abre um change stream na
+coleção `propostas`, monta um envelope JSON por evento e publica no tópico
 `propostas.cdc` com `id_proposta` como chave da mensagem. Roda como serviço
 próprio no Compose, depende de `mongo-init` e `kafka-init` saudáveis.
 
@@ -198,8 +201,8 @@ queda do Mongo, e resume token inválido/corrompido) está na seção
 
 ### Bronze em streaming
 
-Job Spark Structured Streaming (`spark-jobs/bronze/bronze_job.py`) que lê o
-tópico `propostas.cdc` continuamente e grava em Delta no MinIO
+Escrevi um job Spark Structured Streaming (`spark-jobs/bronze/bronze_job.py`)
+que lê o tópico `propostas.cdc` continuamente e grava em Delta no MinIO
 (`s3a://bronze/propostas`), particionado por `data_evento` (a data derivada
 de `cluster_time_epoch`, não a data de ingestão). Roda como serviço próprio
 no Compose (`bronze`), submetido via `spark-submit` contra o cluster
@@ -254,6 +257,91 @@ configurada na Fase 2 sobrevive o caminho inteiro até o bronze. Reiniciar
 o serviço `bronze` retoma do checkpoint (offset incrementando sem reset),
 sem reprocessar nem perder micro-lotes.
 
+## Fase 4 — o que existe hoje
+
+### Silver: histórico de mudanças e estado atual
+
+Escrevi um job Spark Structured Streaming (`spark-jobs/silver/silver_job.py`)
+que lê a tabela bronze **como stream** (Delta é fonte e destino ao mesmo
+tempo — o encadeamento clássico de arquitetura medalhão) e materializa
+duas visões Delta, escritas no mesmo `foreachBatch` a partir do mesmo lote:
+
+- **`s3a://silver/historico`**: uma linha por intervalo de validade de
+  status (`valido_de`/`valido_ate`, SCD tipo 2). Só transições de status
+  reais geram linha nova — uma correção retroativa (que não muda status)
+  não aparece aqui.
+- **`s3a://silver/estado_atual`**: uma linha por `id_proposta` com a
+  versão mais recente conhecida, atualizada via `MERGE INTO` — insere,
+  atualiza ou remove (em caso de delete) conforme o evento.
+
+Antes de chegar nessas duas escritas, o stream lido do bronze passa por
+`.withWatermark("hora_evento", SILVER_WATERMARK_ATRASO)` seguido de
+`.dropDuplicatesWithinWatermark(["resume_token_data"])` — a deduplicação
+que a Fase 2 deixou pendente (o conector garante at-least-once, não
+exatamente-uma-vez) acontece aqui, pela chave natural do próprio evento do
+MongoDB.
+
+`full_document`/`full_document_before_change` (que o bronze guardou como
+texto JSON intacto) são finalmente processados aqui: os campos comuns a
+qualquer tipo de produto viram colunas tipadas em `estado_atual`
+(`cpf_cliente`, `nome_cliente`, `valor_solicitado`, `status`,
+`data_criacao`, `data_atualizacao`), e tudo que sobra — os campos
+específicos de consignado, cartão ou FGTS — fica preservado, sem perda de
+informação, numa coluna `campos_especificos_json`.
+
+| Variável | Papel |
+|---|---|
+| `SILVER_HISTORICO_PATH` / `SILVER_ESTADO_ATUAL_PATH` | caminho das duas tabelas Delta de saída |
+| `SILVER_CHECKPOINT_PATH` | checkpoint único da streaming query (um job, dois sinks) |
+| `SILVER_WATERMARK_ATRASO` | janela de tolerância para deduplicar por `resume_token_data` |
+| `SILVER_TRIGGER_INTERVALO` / `SILVER_SHUFFLE_PARTITIONS` | mesmo papel que na Fase 3 |
+
+### Testando de verdade: pytest local + streaming real via Docker
+
+Separei em `spark-jobs/silver/transformacoes.py` as duas únicas peças de
+lógica que são Python puro (extrair `campos_especificos_json`; decidir se
+um evento é transição de status) — assim consigo testá-las num venv
+comum, sem precisar de Spark:
+
+```bash
+cd spark-jobs
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest silver/tests/test_transformacoes.py -q
+```
+
+Já a lógica de streaming (watermark, deduplicação, os dois `MERGE INTO`)
+só faz sentido testada com Spark de verdade — isso exige JVM, o que este
+projeto não tem fora de Docker. `spark-jobs/silver/tests/test_silver_job.py`
+sobe uma `SparkSession` local dentro da própria imagem `credpipe/spark`,
+escreve lotes num Delta temporário simulando o bronze, e chama
+`query.processAllAvailable()` (o utilitário oficial do Spark para testar
+streaming de forma síncrona e determinística) entre cada lote:
+
+```bash
+docker run --rm --user root \
+  -v "<caminho-absoluto-do-repo>/spark-jobs:/work" \
+  -e HOME=/tmp \
+  -e PYTHONPATH="/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.7-src.zip:/opt/spark/python/lib/pyspark.zip" \
+  -w /work/silver \
+  credpipe/spark:3.5.8 sh -c "pip3 install -q pytest && python3 -m pytest tests/ -q"
+```
+
+Os testes provam, com dados de verdade passando pelo pipeline real (não
+mocks): que uma transição de status fecha o intervalo anterior no
+histórico e abre um novo; que uma correção retroativa atualiza o
+`estado_atual` sem criar linha no histórico; que um delete remove a
+proposta do `estado_atual` e fecha o histórico com `status = 'deletada'`;
+que uma duplicata exata do mesmo `resume_token_data` dentro da janela do
+watermark é descartada; e que um reprocessamento atrasado (fora da janela)
+não regride o `estado_atual` graças ao guard de timestamp no merge.
+
+Validei também no ambiente real: o job processou o backlog do bronze
+corretamente (histórico com 6 mil+ linhas, transições de status em
+sequência coerente por proposta, `campos_especificos_json` correto por
+tipo de produto), zero propostas deletadas sobrando no `estado_atual`, e
+reiniciar o serviço `silver` retomou do checkpoint sem resetar.
+
 ## Como executar (Linux / WSL2 + Docker Desktop)
 
 Pré-requisitos: Docker Desktop com integração WSL2 habilitada, rodando
@@ -284,8 +372,8 @@ bash scripts/teardown.sh
 
 ### Roteiro de validação manual (Fase 1)
 
-Confirma que o ambiente sobe de ponta a ponta numa máquina limpa. Todos os
-comandos abaixo usam:
+Uso este roteiro para confirmar que o ambiente sobe de ponta a ponta numa
+máquina limpa. Todos os comandos abaixo usam:
 
 ```bash
 docker compose -f infra/docker-compose.yml --env-file infra/.env <comando>
@@ -415,8 +503,8 @@ verdade e derrubando cada peça — é o que o roteiro abaixo documenta.
 
 ### Roteiro de resiliência (Fase 2)
 
-Os três cenários exigidos, mais um extra, todos rodados de verdade contra
-o ambiente com Fase 1 + Fase 2 no ar. Comandos no formato:
+Rodei os três cenários exigidos, mais um extra, de verdade contra o
+ambiente com Fase 1 + Fase 2 no ar. Comandos no formato:
 
 ```bash
 docker compose -f infra/docker-compose.yml --env-file infra/.env <comando>
@@ -725,13 +813,80 @@ Spark, com checkpoint e rastreamento de offset), não um `while True` com
 cada evento individual, o que acabaria em excesso de arquivos pequenos no
 Delta.
 
+## Decisões e trade-offs (Fase 4)
+
+**Dedupliquei por `resume_token_data`, não por `(id_proposta,
+cluster_time_epoch)`.** `resume_token_data` é o `_id` do próprio evento do
+change stream do MongoDB — único por definição, já que é a posição exata
+no oplog. Duas mensagens Kafka com o mesmo `resume_token_data` são
+garantidamente o mesmo evento reprocessado (o cenário at-least-once que a
+Fase 2 documentou), não uma coincidência de timing. Usei
+`dropDuplicatesWithinWatermark` (recurso do Spark 3.5, feito
+especificamente para esse padrão de CDC) em vez do `dropDuplicates` +
+`withWatermark` clássico, porque não preciso incluir a coluna de tempo na
+chave de deduplicação — só o `resume_token_data` já identifica
+univocamente o evento.
+
+**Política explícita para dado atrasado: dentro da janela do watermark, é
+deduplicado; fora dela, não é mais deduplicado pelo motor de streaming, mas
+não corrompe o `estado_atual`.** Escolhi `SILVER_WATERMARK_ATRASO=10
+minutes` como padrão — dá margem folgada para os cenários de reconexão da
+Fase 2 (Kafka ou Mongo caindo por alguns minutos) sem manter estado
+indefinidamente. Um duplicado que chegasse depois dessa janela deixaria de
+ser pego pela deduplicação, mas o `MERGE` do `estado_atual` só aplica
+`UPDATE` quando `novo.hora_evento > alvo.hora_evento` — um evento antigo
+reaparecendo nunca regride um estado mais novo. **Provei os dois lados dessa
+decisão com teste**: `test_duplicata_exata_dentro_do_watermark_e_descartada`
+confirma a deduplicação dentro da janela, e
+`test_reprocessamento_atrasado_nao_regride_o_estado_atual` confirma que,
+mesmo sem a proteção do watermark, o guard de timestamp no merge segura a
+consistência.
+
+**Histórico usa fechar-e-inserir em duas etapas, não um único `MERGE`.**
+Um `MERGE` do Delta não consegue expressar "insira a linha 1, depois use a
+linha 1 para fechar a linha 2" quando várias transições da mesma proposta
+caem no mesmo micro-lote (ex.: `em_analise → aprovada → paga` no mesmo
+lote). Resolvi em duas operações: primeiro um `MERGE` que só fecha a linha
+aberta existente na tabela alvo (usando a primeira transição do lote por
+proposta), depois um `append` simples das novas linhas — cada uma já com
+seu próprio `valido_ate` calculado via `lead()` dentro do lote. A única
+linha que fica com `valido_ate = NULL` é a mais recente por proposta,
+tornando-a a "linha aberta" que o próximo lote vai fechar.
+
+**Delete remove do `estado_atual`, mas fecha o histórico com `status =
+'deletada'`.** Uma proposta deletada era "criada por engano" (decisão da
+Fase 1) — não faz sentido ela continuar aparecendo como se ainda existisse
+no estado atual. Mas simplesmente apagar sua história também esconderia
+que ela existiu e foi removida. Optei por um meio-termo auditável: sai do
+`estado_atual`, mas o histórico ganha uma última linha explícita marcando
+o encerramento.
+
+**`campos_especificos_json` é uma string JSON, não um `MAP<STRING,
+STRING>`.** Um mapa forçaria todo valor (inteiro, float, string) a virar
+texto de qualquer forma — uma coluna JSON preserva os tipos originais
+(`prazo_meses` continua inteiro, `taxa_juros` continua float dentro do
+JSON) e é igualmente consultável via `get_json_object`/`from_json` sob
+demanda, sem exigir um schema Spark rígido que quebraria a cada campo novo
+por tipo de produto.
+
+**Descobri rodando de verdade que o custo do `MERGE` cresce com o tamanho
+da tabela alvo.** Cada `MERGE INTO` precisa escanear/planejar contra a
+tabela inteira; com o `historico`/`estado_atual` crescendo, o tempo por
+lote foi subindo (de ~5s para mais de 30s por lote após um restart com
+backlog acumulado), gerando avisos de "batch falling behind" no log. Isso
+é esperado e não afeta a correção (o motor de streaming absorve o atraso,
+não perde nem duplica dado), mas é uma limitação real que documento aqui
+em vez de esconder: em produção, isso pediria `OPTIMIZE`/Z-ordering
+periódico nas tabelas Delta — fora do escopo desta fase, mas anotado como
+próximo passo natural de performance, não de correção.
+
 ## Estrutura do repositório
 
 ```
 infra/            docker-compose.yml, Dockerfile do Spark, scripts de init
 generator/        gerador de carga operacional (Fase 1), com generator/tests/
 connector/        conector de change streams (Fase 2), com connector/tests/
-spark-jobs/       jobs Spark: bronze/ (Fase 3); silver/ e gold/ ainda não implementados
+spark-jobs/       jobs Spark: bronze/ (Fase 3), silver/ (Fase 4); gold/ ainda não implementado
 scripts/          bootstrap.sh, teardown.sh, generate-kafka-cluster-id.sh
 ```
 
@@ -741,14 +896,18 @@ Roteiros de validação manual e de resiliência ficam no próprio README (ver
 
 ## Próximos passos
 
-O que pretendo adicionar nas próximas fases:
+O que pretendo adicionar na Fase 5, a última:
 
-- **Fase 4**: histórico de mudanças, estado atual via merge, watermark e
-  política de dado atrasado (com teste), tratamento de heterogeneidade de
-  schema, tratamento de delete/replace na camada analítica — e é aqui que
-  entram a seção **"Resiliência"** completa e a comparação **change
-  streams × CDC do SQL Server**.
-- **Fase 5**: agregações gold, checks de qualidade com reconciliação
-  Mongo × gold, métricas operacionais do pipeline, consultas DuckDB
-  versionadas, capturas de tela da Spark UI em streaming / tópico Kafka /
-  DuckDB.
+- Agregações gold em janela (volume/valor por produto, taxa de aprovação,
+  tempo médio até decisão, funil de status).
+- Checks de qualidade no fluxo (estado impossível, valor fora de faixa,
+  transição inválida) e reconciliação entre a contagem no Mongo e no gold.
+- Métricas operacionais do pipeline (atraso de consumo, eventos por
+  segundo, tamanho do estado) e como acompanhá-las.
+- Consultas de exemplo em DuckDB sobre o gold, versionadas no repositório.
+- A seção **"Resiliência"** consolidada olhando o pipeline inteiro, e a
+  comparação **change streams × CDC do SQL Server** — fazem mais sentido
+  como fechamento com o pipeline completo do que forçadas numa fase
+  anterior.
+- Capturas de tela da Spark UI em streaming, do tópico Kafka e das
+  consultas no DuckDB.
