@@ -1,6 +1,10 @@
 import json
 
-from transformacoes import eh_transicao_de_status, extrair_campos_especificos
+from transformacoes import (
+    eh_transicao_de_status,
+    extrair_campos_especificos,
+    mesclar_full_document_com_update_description,
+)
 
 
 def test_extrai_campos_especificos_de_consignado():
@@ -77,3 +81,25 @@ def test_update_sem_status_no_updated_fields_nao_e_transicao():
 
 def test_update_sem_update_description_nao_e_transicao():
     assert eh_transicao_de_status("update", None) is False
+
+
+def test_mesclar_sobrescreve_full_document_com_updated_fields():
+    documento_fonte = json.dumps({"id_proposta": "prop-4", "status": "paga", "valor_solicitado": 100.0})
+    update_description = json.dumps({"updatedFields": {"status": "aprovada"}})
+
+    resultado = json.loads(mesclar_full_document_com_update_description(documento_fonte, update_description))
+
+    assert resultado["status"] == "aprovada"
+    assert resultado["valor_solicitado"] == 100.0
+
+
+def test_mesclar_sem_update_description_mantem_full_document():
+    documento_fonte = json.dumps({"id_proposta": "prop-5", "status": "em_analise"})
+
+    resultado = json.loads(mesclar_full_document_com_update_description(documento_fonte, None))
+
+    assert resultado["status"] == "em_analise"
+
+
+def test_mesclar_documento_nulo_retorna_none():
+    assert mesclar_full_document_com_update_description(None, json.dumps({"updatedFields": {}})) is None

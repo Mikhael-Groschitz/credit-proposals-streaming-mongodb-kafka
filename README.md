@@ -11,8 +11,8 @@ Compose, na mesma rede.
 
 ## Status do projeto
 
-Estou construindo isso em fases, validando cada uma de ponta a ponta antes
-de passar para a próxima. Por enquanto:
+Construí isso em cinco fases, validando cada uma de ponta a ponta antes de
+passar para a próxima. Todas estão prontas:
 
 - [x] **Fase 1 — Ambiente e fonte operacional**: ambiente Docker completo e
       gerador de carga operacional
@@ -25,13 +25,15 @@ de passar para a próxima. Por enquanto:
 - [x] **Fase 4 — Silver e estado atual**: histórico de mudanças (SCD2),
       estado atual via merge, watermark com deduplicação, tratamento de
       delete e de heterogeneidade de schema — cada um provado com teste
-- [ ] Fase 5 — Gold, qualidade e observabilidade
+- [x] **Fase 5 — Gold, qualidade e observabilidade**: agregações em janela
+      (funil de status, volume/valor por produto), tempo de decisão, checks
+      de qualidade (estado impossível, valor fora de faixa, transição
+      inválida), reconciliação Mongo × gold, consultas de exemplo em DuckDB
 
 A comparação change streams × CDC do SQL Server e a seção "Resiliência"
-consolidada (olhando o pipeline inteiro, não só uma peça) ficaram para a
-Fase 5 — fazem mais sentido como fechamento depois que o pipeline completo
-existir, em vez de forçadas numa fase que ainda não tinha gold nem
-qualidade prontos.
+consolidada (olhando o pipeline inteiro, não só uma peça) ficam para o
+final, depois de "Decisões e trade-offs" — fazem mais sentido como
+fechamento com o pipeline completo pronto.
 
 ## Arquitetura de ponta a ponta (alvo do projeto completo)
 
@@ -60,11 +62,15 @@ flowchart LR
     LAKE_B --> SILVER
     SILVER -->|Delta merge| LAKE_S[("MinIO: silver")]
 
-    subgraph f5["Fase 5 — planejado"]
-        GOLD["Spark: agregações em janela\n+ checks de qualidade"]
+    subgraph f5["Fase 5 — pronto"]
+        GOLD["Spark: agregações em janela\n+ tempo de decisão"]
+        QUALIDADE["Spark: checks de qualidade\n(estado, valor, transição)"]
     end
     LAKE_S --> GOLD
+    LAKE_B --> QUALIDADE
+    LAKE_S --> QUALIDADE
     GOLD -->|Delta| LAKE_G[("MinIO: gold")]
+    QUALIDADE -->|Delta| LAKE_G
     LAKE_G --> DUCK["DuckDB\nconsultas de exemplo"]
 ```
 
@@ -341,6 +347,206 @@ corretamente (histórico com 6 mil+ linhas, transições de status em
 sequência coerente por proposta, `campos_especificos_json` correto por
 tipo de produto), zero propostas deletadas sobrando no `estado_atual`, e
 reiniciar o serviço `silver` retomou do checkpoint sem resetar.
+
+## Fase 5 — o que existe hoje
+
+### Gold: métricas de negócio e tempo de decisão
+
+Escrevi `spark-jobs/gold/gold_job.py`, um job Spark Structured Streaming com
+três streaming queries rodando na mesma `SparkSession`
+(`spark.streams.awaitAnyTermination()`), porque cada uma tem uma fonte ou
+uma semântica de agregação diferente:
+
+- **`s3a://gold/funil_status`**: agregação em janela (`GOLD_JANELA_FUNIL`,
+  padrão 1 dia) por `tipo_produto` + `status`, lendo o histórico da Fase 4
+  como stream. Uso `groupBy(window(...), tipo_produto, status).count()` com
+  `outputMode("update")` — cada micro-lote emite o total **já acumulado**
+  daquela janela até agora, não um delta, então o `MERGE` no `foreachBatch`
+  substitui a quantidade persistida em vez de somar.
+- **`s3a://gold/volume_valor_por_produto`**: mesma técnica de janela, mas lida
+  direto do bronze e filtra só `operation_type = 'insert'` — cada proposta
+  entra exatamente uma vez nessa contagem, então atualizações posteriores de
+  status não inflam volume nem valor.
+- **`s3a://gold/tempo_decisao`**: uma linha por proposta que chegou a
+  `aprovada`/`recusada`, com o tempo entre a primeira entrada no histórico e
+  a decisão. Calculado via releitura estática do histórico completo dentro
+  do `foreachBatch` (mesma técnica que a Fase 4 já usa para o `MERGE` do
+  `estado_atual`), buscando o `min(valido_de)` por `id_proposta`.
+- **`s3a://gold/contagem_atual_por_status`**: recomputada por inteiro
+  (`overwrite`) a cada micro-lote, contando linhas do histórico com
+  `valido_ate IS NULL` e `status != 'deletada'`. É o número que uso na
+  reconciliação com o Mongo, abaixo.
+
+### Qualidade: estado impossível, valor fora de faixa, transição inválida
+
+Escrevi `spark-jobs/gold/qualidade_job.py` separado do `gold_job.py` porque
+lida com fontes e uma finalidade diferentes (validação, não métrica de
+negócio). Roda dois checks independentes, cada um sua própria streaming
+query, escrevendo violações em `s3a://gold/qualidade_violacoes`:
+
+- **Estado impossível** e **valor fora de faixa**: lidos do bronze (o
+  documento bruto de `insert`/`update`/`replace`), comparando `status`
+  contra o conjunto de estados conhecidos e `valor_solicitado` contra a
+  faixa observada de cada produto — os mesmos limites que o próprio gerador
+  de carga usa em `generator/app/factories.py` (`spark-jobs/gold/transformacoes.py`,
+  `FAIXA_VALOR_POR_PRODUTO`). Deletes não são verificados: o objetivo é
+  sinalizar dado inválido entrando no pipeline, não reauditar o que já saiu
+  dele.
+- **Transição inválida**: lida do histórico, comparando o status de cada
+  linha nova com o status da linha imediatamente anterior da mesma
+  proposta — usando `lag("status")` sobre uma janela ordenada por
+  `(valido_de, resume_token_data)`, o mesmo critério de desempate que a
+  Fase 4 já usa para decidir ordem dentro de um lote. Comparo contra o
+  mesmo grafo de transições de `generator/app/state_machine.py`
+  (duplicado deliberadamente em `transformacoes.py`: o job gold não
+  depende do pacote do gerador para continuar implantável de forma
+  independente — mantido em sincronia manualmente, um trade-off que
+  registro em vez de esconder).
+
+| Variável | Papel |
+|---|---|
+| `GOLD_FUNIL_PATH` / `GOLD_VOLUME_VALOR_PATH` / `GOLD_TEMPO_DECISAO_PATH` / `GOLD_CONTAGEM_ATUAL_PATH` / `GOLD_VIOLACOES_PATH` | caminho de cada tabela Delta de saída |
+| `GOLD_CHECKPOINT_*` | um checkpoint por streaming query (5 no total entre os dois jobs) |
+| `GOLD_WATERMARK_ATRASO` / `GOLD_JANELA_FUNIL` | mesma lógica de tolerância a atraso da Fase 4, aplicada às agregações em janela |
+
+### Reconciliação Mongo × gold
+
+`contagem_atual_por_status` soma para o total de propostas que o pipeline
+considera "abertas" (não deletadas). Esse número tem que bater com a
+contagem de documentos no MongoDB — são, por definição, a mesma coisa vista
+por dois caminhos diferentes. Com o gerador parado (para a contagem não
+mudar no meio da comparação):
+
+```bash
+docker compose -f infra/docker-compose.yml --env-file infra/.env \
+  exec mongo mongosh --quiet creditodb --eval "db.propostas.countDocuments({})"
+```
+
+E do lado do gold, via DuckDB (`queries/gold/reconciliacao_contagem_atual.sql`,
+conexão em `queries/gold/00_conexao.sql`):
+
+```sql
+SELECT sum(quantidade) AS total_propostas_abertas_no_gold
+FROM delta_scan('s3://gold/contagem_atual_por_status');
+```
+
+Rodei essa reconciliação de verdade parando `generator`+`connector`, esperando
+o pipeline drenar (`bronze`/`silver`/`gold` sem `falling behind` no log) e
+comparando os dois números — bateram exatamente. Enquanto o gerador está
+ativo, um descompasso pequeno é esperado (eventos em trânsito no Kafka ou
+ainda não processados pelo streaming) — não é sinal de perda de dado, só de
+latência de ponta a ponta.
+
+### O que a validação de qualidade encontrou rodando de verdade
+
+Rodei o `qualidade_job.py` contra o backlog acumulado de várias horas do
+gerador de carga e ele apontou **508 transições "inválidas"** — um número
+alto demais para ignorar. Investigando os pares de status mais comuns
+(`em_analise -> paga`, `paga -> em_analise`, `cancelada -> aprovada`...), a
+causa raiz não estava na Fase 5: era uma corrida de condição real e bem
+documentada do `fullDocument: "updateLookup"` do MongoDB — ele busca o
+documento **no momento em que o change stream é lido**, não no momento em
+que aquele update específico aconteceu. Duas atualizações rápidas em
+sequência na mesma proposta (ex.: `aprovada` seguida de `paga` poucos
+segundos depois) podem fazer o evento mais antigo chegar com
+`full_document.status` já mostrando o valor **mais novo**, mesmo
+`updateDescription.updatedFields.status` trazendo o valor correto daquele
+evento específico. Confirmei isso direto no bronze: o evento com
+`updatedFields: {"status": "aprovada"}` trazia `full_document.status =
+"paga"`.
+
+Esse é um bug real na Fase 4, não na Fase 5 — `estado_atual.status` também
+ficava sujeito a mostrar um valor adiantado nesse cenário. Corrigi em
+`spark-jobs/silver/transformacoes.py` (`mesclar_full_document_com_update_description`):
+para eventos de `update`, sobreponho `updateDescription.updatedFields` em
+cima do `full_document` antes de extrair qualquer campo — o que aquele
+evento especificamente mudou sempre vence a leitura potencialmente
+adiantada. Reprocessei bronze → silver → gold do zero (limpando checkpoints
+e tabelas) e as transições inválidas caíram de 508 para 53 e, depois de
+também corrigir a ausência de `(*, "deletada")` no grafo de transições
+válidas (delete pode acontecer a partir de qualquer estado, por decisão da
+Fase 1), para **2 ocorrências** num total de milhares de transições.
+
+Não persegui essas 2 últimas até a raiz — a hipótese mais provável é uma
+interação rara entre o at-least-once do conector (Fase 2) e o timing exato
+de reconexões, mas não confirmei. Deixo isso registrado como um resíduo
+conhecido, não escondido: o check de qualidade está fazendo exatamente o
+que deveria — apontar anomalias reais para investigação, não fingir que o
+pipeline é perfeito.
+
+### Bug de escala encontrado rodando de verdade: `.isin()` com lista coletada no driver
+
+A primeira versão do `checar_transicoes` e do `escrever_tempo_decisao`
+coletava os `id_proposta` do micro-lote pro driver (`.collect()`) e filtrava
+a leitura estática do histórico com `.filter(col("id_proposta").isin(lista))`.
+Funciona bem com poucos IDs por lote — mas ao reprocessar um backlog de
+horas depois de eu ter zerado um checkpoint de teste, o job **travou**
+silenciosamente (sem erro, sem exceção, CPU do executor parado) processando
+um único micro-lote com milhares de IDs distintos: embutir uma lista desse
+tamanho no plano lógico do Catalyst explode o tamanho do plano serializado
+(vi o aviso `Broadcasting large task binary with size 2.2 MiB` no log antes
+de travar). Troquei por um `join` com `F.broadcast()` contra um DataFrame de
+IDs distintos — a mesma filtragem, mas o Spark resolve via hash join em vez
+de uma cláusula `IN` gigante no plano, e escala independente do tamanho do
+backlog.
+
+### Testando de verdade a Fase 5: pytest local + streaming real via Docker
+
+`spark-jobs/gold/transformacoes.py` reúne a lógica pura e testável sem Spark
+(`estado_e_impossivel`, `valor_fora_de_faixa`, `transicao_e_valida`):
+
+```bash
+cd spark-jobs
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest gold/tests/test_transformacoes.py -q
+```
+
+`gold/tests/test_gold_job.py` e `gold/tests/test_qualidade_job.py` sobem uma
+`SparkSession` local dentro da imagem `credpipe/spark`, como já fazia a
+Fase 4:
+
+```bash
+docker run --rm --user root \
+  -v "<caminho-absoluto-do-repo>/spark-jobs:/work" \
+  -e HOME=/tmp \
+  -e PYTHONPATH="/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.7-src.zip:/opt/spark/python/lib/pyspark.zip" \
+  -w /work/gold \
+  credpipe/spark:3.5.8 sh -c "pip3 install -q pytest && python3 -m pytest tests/ -q"
+```
+
+Os testes provam, com Spark de verdade: que a agregação de janela soma
+corretamente eventos no mesmo grupo e não atualiza uma janela já expirada
+pelo watermark (`test_evento_muito_atrasado_nao_atualiza_janela_ja_expirada`);
+que `tempo_decisao` calcula o intervalo certo; que `contagem_atual_por_status`
+reflete só propostas ainda abertas; que um documento com status desconhecido
+ou valor fora da faixa do produto gera violação e um documento válido não
+gera nenhuma; que delete não é verificado; e que duas transições da mesma
+proposta no **mesmo segundo** (a colisão de precisão que o
+`cluster_time_epoch` com granularidade de segundo pode causar) são
+corretamente ordenadas usando `resume_token_data` como desempate, sem gerar
+falso positivo (`test_transicoes_no_mesmo_segundo_usam_resume_token_como_desempate`).
+
+### Observabilidade
+
+- **Spark UI por serviço**: `bronze` (4040), `silver` (4041), `gold` (4042),
+  `qualidade` (4043) — cada um com sua própria aba "Structured Streaming",
+  mostrando taxa de entrada/processamento por query e, para o `funil_status`
+  (a única agregação com estado deste projeto), o gráfico "Aggregated
+  Number Of Total State Rows" — é ali que se vê o tamanho do estado
+  crescendo com o número de janelas × produtos × status ainda dentro do
+  watermark.
+- **Atraso de consumo do Kafka**: não uso `kafka-consumer-groups.sh
+  --describe` para medir lag do `bronze` — o conector de leitura Kafka do
+  Spark Structured Streaming **não comita offset como grupo de consumidor**
+  (gerencia tudo via checkpoint próprio), então essa ferramenta clássica não
+  mostra nada útil aqui. O sinal correto é o progresso da própria query, via
+  Spark UI ou `query.lastProgress`: cada `StreamingQueryProgress` traz, por
+  fonte, `latestOffset` (o que já existe no tópico) e `endOffset` (até onde
+  este micro-lote leu) — a diferença entre os dois é o atraso real.
+- **Eventos por segundo**: visível tanto no log do `generator`
+  (`docker compose logs -f generator`) quanto no gráfico "Input Rate" de
+  cada streaming query no Spark UI.
 
 ## Como executar (Linux / WSL2 + Docker Desktop)
 
@@ -789,21 +995,24 @@ tópico. Com o checkpoint em `s3a://bronze/_checkpoints/propostas`,
 comprovei reiniciando o serviço `bronze`: o offset do checkpoint continuou
 de onde parou, sem reprocessar nem pular nada.
 
-**`spark.cores.max=2` explícito no job — descobri isso testando de
-verdade, não por antecipação.** O `spark-worker` de nó único tem um total
-fixo de cores; sem limitar quanto cada aplicação Spark pode reservar, a
-primeira aplicação submetida ao cluster (o próprio job bronze) toma **todo**
-o cluster por padrão no modo standalone, e qualquer outra tentativa de
-rodar uma segunda aplicação (uma consulta ad-hoc, ou os jobs de silver/gold
-que vêm nas próximas fases) fica esperando recursos que nunca sobram. Achei
-isso ao tentar rodar uma verificação ad-hoc contra a tabela Delta enquanto
-o bronze estava no ar: o comando simplesmente travou. Corrigi limitando
-cada job a uma fração do cluster (`spark.cores.max`) e aumentei o
-`spark-worker` de 2 para 6 cores, dando espaço para bronze + silver + gold
-rodarem ao mesmo tempo mais adiante. Para qualquer consulta ad-hoc contra o
-Delta (como fiz para validar isso), uso `--master local[2]` em vez de
-`spark://spark-master:7077` — não compete pelo cluster standalone e lê o
-Delta no MinIO da mesma forma.
+**`spark.cores.max` explícito no job — descobri isso testando de verdade,
+não por antecipação.** O `spark-worker` de nó único tem um total fixo de
+cores; sem limitar quanto cada aplicação Spark pode reservar, a primeira
+aplicação submetida ao cluster (o próprio job bronze) toma **todo** o
+cluster por padrão no modo standalone, e qualquer outra tentativa de rodar
+uma segunda aplicação (uma consulta ad-hoc, ou os jobs de silver/gold que
+vêm nas próximas fases) fica esperando recursos que nunca sobram. Achei isso
+ao tentar rodar uma verificação ad-hoc contra a tabela Delta enquanto o
+bronze estava no ar: o comando simplesmente travou. Corrigi limitando cada
+job a uma fração do cluster (`spark.cores.max=2` nesta fase, aumentei o
+`spark-worker` de 2 para 6 cores) para dar espaço a bronze + silver + gold
+rodarem ao mesmo tempo mais adiante — a Fase 5, ao somar um quarto job
+concorrente (`qualidade`) e esbarrar no limite de memória da VM do WSL2,
+reduziu esses números outra vez (`spark.cores.max=1` por job,
+`spark-worker` com 4 cores; ver "Resiliência", abaixo). Para qualquer
+consulta ad-hoc contra o Delta (como fiz para validar isso), uso
+`--master local[2]` em vez de `spark://spark-master:7077` — não compete
+pelo cluster standalone e lê o Delta no MinIO da mesma forma.
 
 **Trigger de streaming explícito (`BRONZE_TRIGGER_INTERVALO=10 seconds`),
 não o default "o mais rápido possível".** Um trigger nomeado deixa claro
@@ -880,13 +1089,142 @@ em vez de esconder: em produção, isso pediria `OPTIMIZE`/Z-ordering
 periódico nas tabelas Delta — fora do escopo desta fase, mas anotado como
 próximo passo natural de performance, não de correção.
 
+## Decisões e trade-offs (Fase 5)
+
+**Separei `gold_job.py` de `qualidade_job.py` em vez de um job único.**
+Métrica de negócio (funil, volume/valor, tempo de decisão) e checagem de
+qualidade têm fontes e finalidades diferentes — `qualidade_job.py` lê bronze
+diretamente (documento bruto, antes de qualquer achatamento), enquanto
+`gold_job.py` lê exclusivamente o histórico já processado da Fase 4. Juntar
+os dois num job só significaria misturar dois conjuntos de streaming
+queries com propósitos diferentes na mesma `SparkSession`, sem ganho real —
+cada um já roda isolado em seu próprio serviço Compose, com seu próprio
+Spark UI.
+
+**Escolhi `outputMode("update")` + `MERGE` de substituição para as
+agregações em janela, não `outputMode("append")`.** Com `append`, o Spark só
+emite uma janela quando ela é considerada definitivamente fechada pelo
+watermark — o que atrasaria a visibilidade dos números por até
+`GOLD_WATERMARK_ATRASO`. Com `update`, cada micro-lote já emite o total
+corrente da janela (ainda pode receber mais eventos depois, dentro do
+watermark), então o `MERGE` no `foreachBatch` **substitui** a quantidade
+persistida em vez de somar — se fosse `append` incremental, um mesmo
+micro-lote reprocessado (ex.: depois de um restart) duplicaria a contagem.
+
+**Faixas de valor por produto vieram do próprio gerador de carga, não de
+uma regra de negócio nova.** `FAIXA_VALOR_POR_PRODUTO` em
+`spark-jobs/gold/transformacoes.py` usa os mesmos intervalos de
+`generator/app/factories.py` (consignado 1.000–50.000, cartão 500–15.000,
+fgts 1.000–27.000). Isso faz o check de qualidade pegar um caso real e
+esperado: uma correção retroativa (que sorteia um novo valor entre 500 e
+50.000, sem respeitar o teto do produto) pode empurrar uma proposta de
+cartão para um valor acima do seu teto — validado rodando de verdade contra
+o gerador, não um cenário sintético.
+
+**Prefiro dois testes de integração reproduzindo colisões de precisão a
+confiar cegamente no `resume_token_data` como desempate.** O
+`cluster_time_epoch` (desde a Fase 3) tem granularidade de segundo — duas
+transições da mesma proposta no mesmo segundo são um cenário real sob a
+carga deste gerador, não hipotético. Optei por **não** aumentar a precisão
+do timestamp agora (mudaria o schema do bronze, uma fase já revisada);
+em vez disso, todo código da Fase 5 que precisa de ordem usa
+`(valido_de, resume_token_data)` como chave de ordenação — o mesmo critério
+que a Fase 4 já usa — e provei com teste que isso resolve corretamente o
+empate.
+
+## Resiliência
+
+Consolidando aqui os cenários testados de verdade ao longo de todas as
+fases, mais um novo, olhando o pipeline inteiro:
+
+**Reinício de qualquer job Spark (bronze/silver/gold/qualidade) retoma do
+checkpoint, sem perder nem duplicar.** Testado reiniciando cada serviço
+individualmente com `docker compose restart <serviço>` durante carga ativa:
+o offset do checkpoint sempre continuou de onde parou.
+
+**Queda do Kafka ou do MongoDB é absorvida pelo conector com backoff
+exponencial, sem perder evento.** Roteiro completo na Fase 2, acima
+("Roteiro de resiliência (Fase 2)") — o pior caso é reprocessar o último
+lote em memória, nunca perder um.
+
+**Resume token inválido/corrompido faz o conector falhar de forma visível
+(`docker compose ps` mostra `Exited`), nunca pular eventos silenciosamente.**
+Também documentado na Fase 2.
+
+**Um job downstream (gold/qualidade) não trava a montante se ficar
+indisponível — só atrasa.** Parei `gold` e `qualidade` por período extenso
+enquanto validava outras partes do pipeline; `bronze` e `silver` continuaram
+publicando normalmente (são streams independentes, sem acoplamento direto),
+e ao religar `gold`/`qualidade` eles reprocessaram o backlog acumulado do
+zero (a partir de seus próprios checkpoints) sem intervenção manual.
+
+**Reprocessar um backlog grande depois de resetar um checkpoint é uma
+operação pesada, não instantânea — e pode esbarrar em limites do
+ambiente, não do código.** Ao limpar o checkpoint do `qualidade_job.py`
+para validar uma correção, o primeiro micro-lote teve que processar horas
+de histórico acumulado de uma vez. Isso expôs dois problemas reais:
+
+1. Um bug de escala no meu próprio código (`.isin()` com lista coletada no
+   driver não escala — corrigido trocando por `join` com `broadcast`,
+   detalhado na Fase 5 acima).
+2. Rodar `bronze` + `silver` + `gold` + `qualidade` simultaneamente, cada
+   um sua própria JVM Spark, mais Mongo/Kafka/MinIO, pressiona o limite
+   padrão da VM do WSL2 (50% da RAM do host, sem `.wslconfig`
+   customizado) — cheguei a saturar a VM ao ponto do Docker Desktop pausar
+   automaticamente todos os containers (`Resource Saver`). Resolvi
+   reduzindo `spark.driver.memory`/`spark.executor.memory` para 512m e
+   `spark.cores.max=1` em cada job (de 2), e o `spark-worker` de 8 para 4
+   cores — o suficiente para os quatro jobs conviverem em regime normal.
+   Para reprocessar um backlog muito grande num ambiente com pouca RAM
+   livre, a alternativa mais simples é parar os demais jobs, deixar um
+   reprocessar sozinho, e religar os outros em seguida — validei esse
+   fluxo na prática.
+
+**MongoDB `fullDocument: "updateLookup"` pode retornar um documento mais
+adiantado do que o evento representa, se a proposta sofrer outra escrita
+antes do conector ler aquele evento específico.** Descoberto pelo próprio
+check de qualidade da Fase 5 (transições "impossíveis" que na verdade eram
+leitura racional de um `full_document` desatualizado-para-frente). Corrigido
+na Fase 4 (`mesclar_full_document_com_update_description`) sobrepondo
+`updateDescription.updatedFields` — o que aquele evento especificamente
+mudou — por cima do `full_document`, em vez de confiar cegamente nele.
+Detalhado acima, na seção da Fase 5.
+
+## MongoDB change streams × CDC do SQL Server
+
+Já construí captura de mudanças com SQL Server CDC num projeto anterior do
+portfólio (`sqlserver-cdc-to-dw`), o que deixa a comparação concreta, não
+teórica:
+
+| | MongoDB change streams | SQL Server CDC |
+|---|---|---|
+| **Mecanismo de captura** | Lê o oplog do replica set diretamente via um cursor tailable (`watch()`) | Job de captura assíncrono lê o transaction log e grava em tabelas de mudança (`cdc.<schema>_<tabela>_CT`) |
+| **Latência** | Near real-time — o evento aparece no cursor assim que commitado no oplog | Depende do intervalo de polling do job de captura (segundos, configurável) |
+| **Pré-requisito de infraestrutura** | Replica set (mesmo de nó único) — não funciona em standalone | Habilitar CDC no banco e por tabela (`sys.sp_cdc_enable_db`/`_table`); exige Agente SQL Server rodando |
+| **Ponto de retomada** | Resume token opaco, atrelado à posição exata no oplog | LSN (`__$start_lsn`) — comparável entre tabelas, consultável diretamente |
+| **O que acontece se o consumidor ficar off por muito tempo** | Resume token expira quando o oplog "gira" (rotaciona) — falha explícita e auditável (`InvalidResumeToken`/`ChangeStreamHistoryLost`), como implementei na Fase 2 | Job de limpeza do CDC também expira mudanças antigas (`retention`, padrão 3 dias) — mesmo tipo de falha, mecanismo de expiração diferente |
+| **Imagem antes da mudança** | Opt-in por coleção (`changeStreamPreAndPostImages`), com custo de armazenamento extra por gravação | Nativo nas tabelas de mudança (`net_changes` ou `all_changes`, direto na captura) |
+| **Granularidade de escuta** | Por coleção, banco ou cluster inteiro (um único `watch()`) | Por tabela — precisa de uma instância CDC por tabela monitorada |
+| **Schema heterogêneo** | Change stream não impõe schema — o documento pode variar livremente entre eventos, como explorei nas Fases 3/4 | CDC herda o schema fixo da tabela relacional de origem — heterogeneidade exigiria modelagem prévia (colunas esparsas, ou EAV) |
+| **Ordenação garantida** | Por documento, via posição no oplog — usei isso para a chave do Kafka (`id_proposta`) | Por linha, via LSN — mesma garantia, mecanismo diferente |
+
+A diferença que mais pesou na prática: change streams me deram um
+mecanismo de captura já pronto para uso (só chamar `watch()`), enquanto CDC
+no SQL Server exige provisionar e manter uma instância de captura por
+tabela. Em compensação, o LSN do SQL Server é um número comparável e
+consultável a qualquer momento — o resume token do Mongo é opaco, só serve
+para retomar o mesmo cursor, o que tornou necessário eu mesmo desenhar a
+persistência e o tratamento de falha do checkpoint (Fase 2), algo que o
+CDC do SQL Server resolve de forma mais direta com a própria coluna de LSN.
+
 ## Estrutura do repositório
 
 ```
 infra/            docker-compose.yml, Dockerfile do Spark, scripts de init
 generator/        gerador de carga operacional (Fase 1), com generator/tests/
 connector/        conector de change streams (Fase 2), com connector/tests/
-spark-jobs/       jobs Spark: bronze/ (Fase 3), silver/ (Fase 4); gold/ ainda não implementado
+spark-jobs/       jobs Spark: bronze/ (Fase 3), silver/ (Fase 4), gold/ (Fase 5, com gold_job.py e qualidade_job.py)
+queries/gold/     consultas de exemplo em DuckDB sobre as tabelas gold
 scripts/          bootstrap.sh, teardown.sh, generate-kafka-cluster-id.sh
 ```
 
@@ -894,20 +1232,23 @@ Roteiros de validação manual e de resiliência ficam no próprio README (ver
 "Roteiro de validação manual (Fase 1)" e "Roteiro de resiliência
 (Fase 2)", acima) — nada de arquivo markdown solto por fase.
 
-## Próximos passos
+## Considerações finais
 
-O que pretendo adicionar na Fase 5, a última:
+As cinco fases planejadas estão implementadas e validadas rodando de
+verdade, não só por teste unitário: MongoDB → Kafka → Spark Structured
+Streaming → Delta Lake (bronze/silver/gold) → DuckDB, com resume token
+durável, deduplicação por watermark, SCD2, checks de qualidade e
+reconciliação Mongo × gold.
 
-- Agregações gold em janela (volume/valor por produto, taxa de aprovação,
-  tempo médio até decisão, funil de status).
-- Checks de qualidade no fluxo (estado impossível, valor fora de faixa,
-  transição inválida) e reconciliação entre a contagem no Mongo e no gold.
-- Métricas operacionais do pipeline (atraso de consumo, eventos por
-  segundo, tamanho do estado) e como acompanhá-las.
-- Consultas de exemplo em DuckDB sobre o gold, versionadas no repositório.
-- A seção **"Resiliência"** consolidada olhando o pipeline inteiro, e a
-  comparação **change streams × CDC do SQL Server** — fazem mais sentido
-  como fechamento com o pipeline completo do que forçadas numa fase
-  anterior.
-- Capturas de tela da Spark UI em streaming, do tópico Kafka e das
-  consultas no DuckDB.
+O que ainda deixo anotado como próximo passo natural, não como pendência de
+correção:
+
+- `OPTIMIZE`/Z-ordering periódico nas tabelas Delta que mais crescem
+  (`historico`, `estado_atual`) — o custo do `MERGE` sobe com o tamanho da
+  tabela alvo (Fase 4), algo que só compensa resolver quando o volume real
+  justificar.
+- As duas transições "impossíveis" residuais que o check de qualidade ainda
+  aponta depois da correção do `updateLookup` (Fase 5, acima) — candidatas a
+  uma investigação futura, não um bug conhecido e ignorado.
+- Capturas de tela da Spark UI em streaming, do tópico Kafka e das consultas
+  no DuckDB.

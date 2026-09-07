@@ -252,6 +252,42 @@ def test_duplicata_exata_dentro_do_watermark_e_descartada(spark, config):
     assert len(estado) == 1
 
 
+def test_update_lookup_com_full_document_adiantado_usa_status_do_update_description(spark, config):
+    _escrever_no_bronze(
+        spark,
+        config,
+        [
+            _linha_bronze(
+                "prop-race", "insert", 1000, "token-1",
+                full_document={"id_proposta": "prop-race", "tipo_produto": "cartao", "status": "em_analise"},
+            )
+        ],
+    )
+    query = silver_job.construir_query(spark, config)
+    query.processAllAvailable()
+
+    _escrever_no_bronze(
+        spark,
+        config,
+        [
+            _linha_bronze(
+                "prop-race", "update", 2000, "token-2",
+                full_document={"id_proposta": "prop-race", "tipo_produto": "cartao", "status": "paga"},
+                update_description={"updatedFields": {"status": "aprovada"}},
+            )
+        ],
+    )
+    query.processAllAvailable()
+    query.stop()
+
+    historico = _ler_historico(spark, config).filter("id_proposta = 'prop-race'").collect()
+    assert len(historico) == 2
+    assert historico[1]["status"] == "aprovada"
+
+    estado = _ler_estado_atual(spark, config).filter("id_proposta = 'prop-race'").collect()
+    assert estado[0]["status"] == "aprovada"
+
+
 def test_reprocessamento_atrasado_nao_regride_o_estado_atual(spark, config):
     original = _linha_bronze(
         "prop-5", "update", 5000, "token-original",

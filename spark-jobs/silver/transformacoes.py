@@ -35,3 +35,15 @@ def eh_transicao_de_status(operation_type: str, update_description_json: str | N
     update_description = json.loads(update_description_json)
     campos_alterados = update_description.get("updatedFields", {})
     return "status" in campos_alterados
+
+
+def mesclar_full_document_com_update_description(
+    documento_fonte_json: str | None, update_description_json: str | None
+) -> str | None:
+    if documento_fonte_json is None:
+        return None
+    documento = json.loads(documento_fonte_json)
+    if update_description_json is not None:
+        update_description = json.loads(update_description_json)
+        documento.update(update_description.get("updatedFields", {}))
+    return json.dumps(documento, ensure_ascii=False)

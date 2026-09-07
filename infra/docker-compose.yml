@@ -184,7 +184,7 @@ services:
     image: credpipe/spark:3.5.8
     hostname: spark-worker
     entrypoint: ["/opt/spark/bin/spark-class"]
-    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--cores", "6", "--memory", "3g", "--webui-port", "8081"]
+    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--cores", "4", "--memory", "4g", "--webui-port", "8081"]
     environment:
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
@@ -210,9 +210,11 @@ services:
       - "--master"
       - "spark://spark-master:7077"
       - "--conf"
-      - "spark.cores.max=2"
+      - "spark.cores.max=1"
       - "--conf"
-      - "spark.executor.memory=768m"
+      - "spark.executor.memory=512m"
+      - "--conf"
+      - "spark.driver.memory=512m"
       - "/opt/bronze/bronze_job.py"
     volumes:
       - ../spark-jobs/bronze:/opt/bronze:ro
@@ -252,9 +254,11 @@ services:
       - "--master"
       - "spark://spark-master:7077"
       - "--conf"
-      - "spark.cores.max=2"
+      - "spark.cores.max=1"
       - "--conf"
-      - "spark.executor.memory=768m"
+      - "spark.executor.memory=512m"
+      - "--conf"
+      - "spark.driver.memory=512m"
       - "--py-files"
       - "/opt/silver/transformacoes.py"
       - "/opt/silver/silver_job.py"
@@ -276,6 +280,96 @@ services:
       - credpipe-net
     depends_on:
       bronze:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4040 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+    restart: unless-stopped
+
+  gold:
+    image: credpipe/spark:3.5.8
+    hostname: gold
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    command:
+      - "--master"
+      - "spark://spark-master:7077"
+      - "--conf"
+      - "spark.cores.max=1"
+      - "--conf"
+      - "spark.executor.memory=512m"
+      - "--conf"
+      - "spark.driver.memory=512m"
+      - "/opt/gold/gold_job.py"
+    volumes:
+      - ../spark-jobs/gold:/opt/gold:ro
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      BRONZE_PATH: ${BRONZE_PATH:-s3a://bronze/propostas}
+      SILVER_HISTORICO_PATH: ${SILVER_HISTORICO_PATH:-s3a://silver/historico}
+      GOLD_FUNIL_PATH: ${GOLD_FUNIL_PATH:-s3a://gold/funil_status}
+      GOLD_VOLUME_VALOR_PATH: ${GOLD_VOLUME_VALOR_PATH:-s3a://gold/volume_valor_por_produto}
+      GOLD_TEMPO_DECISAO_PATH: ${GOLD_TEMPO_DECISAO_PATH:-s3a://gold/tempo_decisao}
+      GOLD_CONTAGEM_ATUAL_PATH: ${GOLD_CONTAGEM_ATUAL_PATH:-s3a://gold/contagem_atual_por_status}
+      GOLD_CHECKPOINT_FUNIL_PATH: ${GOLD_CHECKPOINT_FUNIL_PATH:-s3a://gold/_checkpoints/funil}
+      GOLD_CHECKPOINT_VOLUME_VALOR_PATH: ${GOLD_CHECKPOINT_VOLUME_VALOR_PATH:-s3a://gold/_checkpoints/volume_valor}
+      GOLD_CHECKPOINT_METRICAS_PATH: ${GOLD_CHECKPOINT_METRICAS_PATH:-s3a://gold/_checkpoints/metricas}
+      GOLD_WATERMARK_ATRASO: ${GOLD_WATERMARK_ATRASO:-10 minutes}
+      GOLD_JANELA_FUNIL: ${GOLD_JANELA_FUNIL:-1 day}
+      GOLD_TRIGGER_INTERVALO: ${GOLD_TRIGGER_INTERVALO:-10 seconds}
+      GOLD_SHUFFLE_PARTITIONS: ${GOLD_SHUFFLE_PARTITIONS:-6}
+    ports:
+      - "4042:4040"
+    networks:
+      - credpipe-net
+    depends_on:
+      silver:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4040 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+    restart: unless-stopped
+
+  qualidade:
+    image: credpipe/spark:3.5.8
+    hostname: qualidade
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    command:
+      - "--master"
+      - "spark://spark-master:7077"
+      - "--conf"
+      - "spark.cores.max=1"
+      - "--conf"
+      - "spark.executor.memory=512m"
+      - "--conf"
+      - "spark.driver.memory=512m"
+      - "--py-files"
+      - "/opt/gold/transformacoes.py"
+      - "/opt/gold/qualidade_job.py"
+    volumes:
+      - ../spark-jobs/gold:/opt/gold:ro
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      BRONZE_PATH: ${BRONZE_PATH:-s3a://bronze/propostas}
+      SILVER_HISTORICO_PATH: ${SILVER_HISTORICO_PATH:-s3a://silver/historico}
+      GOLD_VIOLACOES_PATH: ${GOLD_VIOLACOES_PATH:-s3a://gold/qualidade_violacoes}
+      GOLD_CHECKPOINT_QUALIDADE_BRONZE_PATH: ${GOLD_CHECKPOINT_QUALIDADE_BRONZE_PATH:-s3a://gold/_checkpoints/qualidade_bronze}
+      GOLD_CHECKPOINT_QUALIDADE_HISTORICO_PATH: ${GOLD_CHECKPOINT_QUALIDADE_HISTORICO_PATH:-s3a://gold/_checkpoints/qualidade_historico}
+      GOLD_TRIGGER_INTERVALO: ${GOLD_TRIGGER_INTERVALO:-10 seconds}
+      GOLD_SHUFFLE_PARTITIONS: ${GOLD_SHUFFLE_PARTITIONS:-6}
+    ports:
+      - "4043:4040"
+    networks:
+      - credpipe-net
+    depends_on:
+      silver:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:4040 || exit 1"]

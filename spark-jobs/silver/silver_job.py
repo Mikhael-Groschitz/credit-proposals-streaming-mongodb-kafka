@@ -16,7 +16,11 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-from transformacoes import eh_transicao_de_status, extrair_campos_especificos
+from transformacoes import (
+    eh_transicao_de_status,
+    extrair_campos_especificos,
+    mesclar_full_document_com_update_description,
+)
 
 ESQUEMA_HISTORICO = StructType(
     [
@@ -98,8 +102,10 @@ def garantir_tabelas(spark: SparkSession, config: ConfigSilver) -> None:
 def preparar_lote(micro_lote: DataFrame) -> DataFrame:
     eh_transicao_udf = F.udf(eh_transicao_de_status, BooleanType())
     campos_especificos_udf = F.udf(extrair_campos_especificos, StringType())
+    mesclar_update_description_udf = F.udf(mesclar_full_document_com_update_description, StringType())
 
-    documento_fonte = F.coalesce(F.col("full_document_json"), F.col("full_document_before_change_json"))
+    documento_fonte_bruto = F.coalesce(F.col("full_document_json"), F.col("full_document_before_change_json"))
+    documento_fonte = mesclar_update_description_udf(documento_fonte_bruto, F.col("update_description_json"))
 
     return (
         micro_lote.withColumn("documento_fonte_json", documento_fonte)
